@@ -1,0 +1,409 @@
+Great — here’s the parameter-aware refactor for all four agents.
+Each agent card now has:
+
+framework + telemetry + arize_config + models
+
+tools_runtime.tools with parameter definitions (type, required, validations, defaults)
+
+trajectory.expected_params per step
+
+
+
+---
+
+1) RouterAgent.yaml
+
+agent_card:
+  name: "RouterAgent"
+  version: "2.2"
+  description: "Routes user requests to RAGAgent, SQLAgent, or WebAgent."
+
+  framework:
+    name: "LangGraph"
+    language: "python"
+    runtime_version: "3.11"
+
+  telemetry:
+    otel_enabled: true
+    trace_exporter: "otlp"
+    metrics_exporter: "prometheus"
+
+  arize_config:
+    project: "multiagent-suite"
+    space: "routing"
+    eval_templates: ["tool_selection.v1", "trajectory.v1"]
+
+  models:
+    router_model: "gpt-4.1-mini-2025-06"
+    judge_model: "gpt-4.1-mini-2025-06"
+
+  dependent_agents:
+    - "RAGAgent"
+    - "SQLAgent"
+    - "WebAgent"
+
+  tools_runtime:
+    default_timeout_ms: 2000
+    retries: 1
+    circuit_breaker: true
+    tools: [] # Router has no direct tools
+
+  goals:
+    - name: "RouteRequest"
+      description: "Identify intent and route to appropriate agent."
+      trigger_examples:
+        - "What is our PTO policy?"
+        - "Show revenue by month"
+        - "Latest news on Basel III"
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 10
+    max_token_limit: 1000
+    max_steps: 3
+
+  loop_detection:
+    enabled: true
+    strategy: "consecutive_repetition"
+    threshold: 1
+
+  routing:
+    rules:
+      - name: "policy_related"
+        match: { keywords: ["policy","procedure","guideline","SOP","compliance"] }
+        route_to: "RAGAgent"
+      - name: "quantitative_related"
+        match: { keywords: ["revenue","assets","transactions","kpi","metric"] }
+        route_to: "SQLAgent"
+      - name: "fallback_web"
+        match: { fallback: true }
+        route_to: "WebAgent"
+
+
+---
+
+2) RAGAgent.yaml
+
+agent_card:
+  name: "TachyonRAGAgent"
+  version: "2.2"
+  description: "Policy & procedure retrieval agent using RAG over corporate KB."
+
+  framework:
+    name: "LangGraph"
+    language: "python"
+    runtime_version: "3.11"
+
+  telemetry:
+    otel_enabled: true
+    trace_exporter: "otlp"
+    metrics_exporter: "prometheus"
+
+  arize_config:
+    project: "multiagent-suite"
+    space: "rag"
+    eval_templates: ["tool_selection.v1", "budgeting.v1", "loop.v1"]
+
+  models:
+    primary: "gpt-4.1-2025-06"
+    embedding_model: "text-embedding-3-large"
+    judge_model: "gpt-4.1-mini-2025-06"
+
+  tools_runtime:
+    default_timeout_ms: 5000
+    retries: 2
+    sandboxed: true
+    tools:
+      - name: semantic_search
+        description: "Semantic search across policy KB"
+        parameters:
+          - name: query
+            type: string
+            required: true
+            validations:
+              - pattern: '(?i)(policy|guideline|document|report)'
+                error_message: "Query must include a policy-related keyword"
+      - name: retrieve_document
+        description: "Retrieve doc by ID"
+        parameters:
+          - name: document_id
+            type: string
+            required: true
+            validations:
+              - pattern: "^[A-Za-z0-9_-]+$"
+                error_message: "Invalid document ID"
+      - name: hybrid_search
+        description: "Hybrid lexical + semantic search"
+        parameters:
+          - name: query
+            type: string
+            required: true
+      - name: summarize_content
+        description: "Summarize text content"
+        parameters:
+          - name: content
+            type: string
+            required: true
+            validations:
+              - min_length: 20
+                error_message: "Summary input too short"
+
+  goals:
+    - name: "SemanticSearchCompanyInfo"
+      description: "Semantic search for company policies."
+    - name: "HybridSearchAndSummarize"
+      description: "Hybrid retrieval of business docs and summarization."
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 90
+    max_token_limit: 10000
+    max_steps: 10
+
+  loop_detection:
+    enabled: true
+    strategies:
+      - type: "consecutive_repetition"
+        threshold: 3
+
+  goal_configurations:
+    SemanticSearchCompanyInfo:
+      safe_tools:
+        allow: ["semantic_search","retrieve_document","summarize_content"]
+        deny: ["text2sql","web_search"]
+      trajectory:
+        - step: 1
+          tool_name: "semantic_search"
+          expected_params:
+            query: { required: true, pattern: "(?i)(policy|guideline)" }
+        - step: 2
+          tool_name: "retrieve_document"
+          condition: "semantic_search.results > 0"
+          expected_params:
+            document_id: { required: true }
+        - step: 3
+          tool_name: "summarize_content"
+          condition: "retrieve_document.content not empty"
+
+    HybridSearchAndSummarize:
+      safe_tools:
+        allow: ["hybrid_search","retrieve_document","summarize_content"]
+        deny: ["text2sql"]
+      trajectory:
+        - step: 1
+          tool_name: "hybrid_search"
+          expected_params:
+            query: { required: true }
+        - step: 2
+          tool_name: "retrieve_document"
+          condition: "hybrid_search.results > 0"
+        - step: 3
+          tool_name: "summarize_content"
+          condition: "retrieve_document.content not empty"
+
+
+---
+
+3) SQLAgent.yaml
+
+agent_card:
+  name: "SQLAgent"
+  version: "2.2"
+  description: "Text-to-SQL agent for quantitative KPIs and metrics."
+
+  framework:
+    name: "LangGraph"
+    language: "python"
+    runtime_version: "3.11"
+
+  telemetry:
+    otel_enabled: true
+    trace_exporter: "otlp"
+    metrics_exporter: "prometheus"
+
+  arize_config:
+    project: "multiagent-suite"
+    space: "sql"
+    eval_templates: ["tool_selection.v1", "budgeting.v1", "tool_misuse.v1"]
+
+  models:
+    primary: "gpt-4.1-2025-06"
+    sql_parser: "text-to-sql-v3"
+    judge_model: "gpt-4.1-mini-2025-06"
+
+  tools_runtime:
+    default_timeout_ms: 8000
+    retries: 2
+    db_schemas: ["finance","sales","assets"]
+    read_only: true
+    tools:
+      - name: text2sql
+        description: "Generate and execute SQL queries"
+        parameters:
+          - name: sql
+            type: string
+            required: true
+            validations:
+              - pattern: '^(?!.*(?i)(drop|delete|update|truncate)).*$'
+                error_message: "DDL/DML not allowed"
+          - name: schema
+            type: string
+            required: true
+            validations:
+              - allowed_values: ["finance","sales","assets"]
+                error_message: "Schema must be finance/sales/assets"
+          - name: row_limit
+            type: integer
+            required: false
+            default: 10000
+            validations:
+              - range: { min: 1, max: 20000 }
+                error_message: "Row limit must be 1–20000"
+      - name: calculator
+        description: "Perform math on SQL results"
+        parameters:
+          - name: expression
+            type: string
+            required: true
+            validations:
+              - pattern: "^[0-9\\+\\-\\*/\\(\\) ]+$"
+                error_message: "Only numeric expressions allowed"
+      - name: summarize_content
+        description: "Summarize SQL results"
+        parameters:
+          - name: content
+            type: string
+            required: true
+            validations:
+              - min_length: 20
+                error_message: "Summary input too short"
+
+  goals:
+    - name: "QuantitativeLookup"
+      description: "Answer metrics and KPIs using SQL queries."
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 120
+    max_token_limit: 8000
+    max_steps: 12
+
+  safe_tools:
+    allow: ["text2sql","calculator","summarize_content"]
+    deny: ["semantic_search","rag_retriever","web_search"]
+
+  trajectory:
+    - step: 1
+      tool_name: "text2sql"
+      must_be_first: true
+      expected_params:
+        schema: { allowed_values: ["finance","sales","assets"] }
+        row_limit: { max: 20000 }
+    - step: 2
+      tool_name: "calculator"
+      condition: "requires_math == true"
+      expected_params:
+        expression: { pattern: "^[0-9\\+\\-\\*/\\(\\) ]+$" }
+    - step: 3
+      tool_name: "summarize_content"
+      condition: "always"
+
+
+---
+
+4) WebAgent.yaml
+
+agent_card:
+  name: "WebAgent"
+  version: "2.2"
+  description: "Public web research agent with summarization and citations."
+
+  framework:
+    name: "LangGraph"
+    language: "python"
+    runtime_version: "3.11"
+
+  telemetry:
+    otel_enabled: true
+    trace_exporter: "otlp"
+    metrics_exporter: "prometheus"
+
+  arize_config:
+    project: "multiagent-suite"
+    space: "web"
+    eval_templates: ["tool_selection.v1", "loop.v1"]
+
+  models:
+    primary: "gpt-4.1-mini-2025-06"
+    judge_model: "gpt-4.1-mini-2025-06"
+
+  tools_runtime:
+    default_timeout_ms: 4000
+    retries: 1
+    tools:
+      - name: web_search
+        description: "Search public web"
+        parameters:
+          - name: query
+            type: string
+            required: true
+            validations:
+              - min_length: 3
+                error_message: "Query too short"
+          - name: site_filter
+            type: string
+            required: false
+            validations:
+              - pattern: "^[a-z0-9.-]+$"
+                error_message: "Invalid site filter"
+      - name: summarize_content
+        description: "Summarize web results"
+        parameters:
+          - name: content
+            type: string
+            required: true
+            validations:
+              - min_length: 20
+                error_message: "Summary input must not be empty"
+
+  goals:
+    - name: "GeneralWebResearch"
+      description: "Search and summarize public web content."
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 90
+    max_token_limit: 6000
+    max_steps: 8
+
+  safe_tools:
+    allow: ["web_search","summarize_content"]
+    deny: ["text2sql","rag_retriever"]
+
+  trajectory:
+    - step: 1
+      tool_name: "web_search"
+      expected_params:
+        query: { min_length: 3 }
+    - step: 2
+      tool_name: "summarize_content"
+      condition: "web_search.results > 0"
+      expected_params:
+        content: { min_length: 20 }
+
+
+---
+
+✅ With these refinements:
+
+Every tool has parameter specs.
+
+Every trajectory step has expected_params.
+
+The evaluator can validate tool correctness and parameter compliance.
+
+Configs are uniform across agents (so you can persist + query them consistently in Mongo).
+
+
+Would you like me to also draft a common JSON Schema that validates all these agent YAMLs (so misconfigured params/steps get caught at CI/CD)?
+
