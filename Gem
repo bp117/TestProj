@@ -1,0 +1,179 @@
+Of course. Here are the complete metadata files for the other three agents, all updated to version 3.1 with the essential argument_rules for parameter validation.
+1. The Routing Agent (routing-agent.yaml)
+This version ensures the query being routed is a valid, non-trivial string.
+# Agent Card Metadata v3.1 (Routing Agent with Parameter Rules)
+# Last updated on 2025-09-22
+# This version adds an 'argument_rules' block to validate the incoming query.
+
+agent_card:
+  name: "RoutingAgent_10K"
+  version: "3.1"
+  description: "Acts as a smart dispatcher, analyzing user queries about 10-K filings and routing them to the appropriate specialist agent."
+
+  goals:
+    - name: "RouteQueryToSpecialistAgent"
+      description: "Classify the user's intent and forward the query to the correct downstream agent."
+
+guardrails:
+  budgeting:
+    max_steps: 3
+    max_duration_seconds: 30
+    max_token_limit: 1024
+
+  goal_configurations:
+    - goal_name: "RouteQueryToSpecialistAgent"
+      reasoning: "The primary goal is delegation. Parameter rules ensure that the query being routed is a valid string, preventing errors in downstream agents."
+
+      safe_tools:
+        allow:
+          - "RAG_10K_PolicyAgent"
+          - "Text2SQL_10K_FinancialAgent"
+          - "WebSearchAgent"
+        deny:
+          - "vector_search"
+          - "execute_sql_query"
+
+        # --- NEW: Parameter Validation Section ---
+        argument_rules:
+          - tool_name: "classify_and_delegate" # Conceptual tool for routing
+            parameter: "user_query"
+            rule:
+              type: "string"
+              required: true
+              min_length: 5 # Prevents routing of empty or trivial queries.
+              pattern_description: "Query must be a meaningful question."
+
+      trajectory:
+        reasoning: "A single-step trajectory to classify and route, preventing the agent from deviating from its core routing task."
+        steps:
+          - step: 1
+            tool_name: "classify_and_delegate"
+            description: "Analyze the user query and invoke the appropriate specialist agent."
+
+2. The RAG Agent (rag-agent.yaml)
+This version validates the inputs for the search, retrieval, and summarization steps of the RAG pipeline.
+# Agent Card Metadata v3.1 (RAG Agent with Parameter Rules)
+# Last updated on 2025-09-22
+# This version adds an 'argument_rules' block to validate RAG pipeline inputs.
+
+agent_card:
+  name: "RAG_10K_PolicyAgent"
+  version: "3.1"
+  description: "Specializes in answering questions about company policies and risk factors using Retrieval-Augmented Generation."
+
+  goals:
+    - name: "AnswerPolicyQuestion"
+      description: "Searches document embeddings and summarizes findings for policy-related queries."
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 120
+    max_token_limit: 8192
+    max_steps: 5
+
+  goal_configurations:
+    - goal_name: "AnswerPolicyQuestion"
+      reasoning: "The agent must follow the RAG pattern. Parameter rules ensure that each step of the pipeline receives valid inputs, making the process more robust."
+
+      safe_tools:
+        allow:
+          - "vector_search"
+          - "retrieve_document_chunk"
+          - "summarize_text"
+        deny:
+          - "execute_sql_query"
+
+        # --- NEW: Parameter Validation Section ---
+        argument_rules:
+          - tool_name: "vector_search"
+            parameter: "query"
+            rule:
+              type: "string"
+              required: true
+              min_length: 5
+          - tool_name: "retrieve_document_chunk"
+            parameter: "chunk_ids"
+            rule:
+              type: "list"
+              required: true
+              min_items: 1 # Must have at least one chunk ID to retrieve.
+          - tool_name: "summarize_text"
+            parameter: "text_content"
+            rule:
+              type: "string"
+              required: true
+              min_length: 50 # Ensures there is substantial text to summarize.
+
+      trajectory:
+        reasoning: "This 3-step RAG trajectory stops context drift by forcing the agent to find evidence before formulating an answer."
+        steps:
+          - step: 1
+            tool_name: "vector_search"
+            description: "Finds relevant document chunks based on semantic similarity."
+          - step: 2
+            tool_name: "retrieve_document_chunk"
+            description: "Fetches the full text of the most relevant chunks."
+            condition: "steps.vector_search.output.chunk_ids is not null"
+          - step: 3
+            tool_name: "summarize_text"
+            description: "Synthesizes an answer based on the content of the retrieved chunks."
+            condition: "steps.retrieve_document_chunk.output.content is not empty"
+
+3. The Web Search Agent (web-search-agent.yaml)
+This version adds rules to ensure that the search query and the results being summarized are valid.
+# Agent Card Metadata v3.1 (Web Search Agent with Parameter Rules)
+# Last updated on 2025-09-22
+# This version adds an 'argument_rules' block for search query and result validation.
+
+agent_card:
+  name: "WebSearchAgent"
+  version: "3.1"
+  description: "A general-purpose agent that can search the web to answer questions outside the scope of the internal 10-K documents."
+
+  goals:
+    - name: "AnswerGeneralQuestion"
+      description: "Performs a web search and summarizes the findings to answer a user's query."
+
+guardrails:
+  budgeting:
+    max_duration_seconds: 90
+    max_token_limit: 8192
+    max_steps: 4
+
+  goal_configurations:
+    - goal_name: "AnswerGeneralQuestion"
+      reasoning: "The agent should provide a summarized result. Parameter rules ensure it starts with a valid search query and only summarizes a valid list of results."
+
+      safe_tools:
+        allow:
+          - "perform_web_search"
+          - "summarize_web_results"
+        deny:
+          - "execute_sql_query"
+
+        # --- NEW: Parameter Validation Section ---
+        argument_rules:
+          - tool_name: "perform_web_search"
+            parameter: "search_query"
+            rule:
+              type: "string"
+              required: true
+              min_length: 3
+          - tool_name: "summarize_web_results"
+            parameter: "search_results"
+            rule:
+              type: "list"
+              required: true
+              min_items: 1 # Must have at least one search result to summarize.
+
+      trajectory:
+        reasoning: "A simple 'search then summarize' workflow to ensure the agent provides a synthesized answer rather than raw search results."
+        steps:
+          - step: 1
+            tool_name: "perform_web_search"
+            description: "Executes a search query on a public search engine."
+          - step: 2
+            tool_name: "summarize_web_results"
+            description: "Summarizes the information gathered from the top search results."
+            condition: "steps.perform_web_search.output.results is not empty"
+
